@@ -235,3 +235,15 @@ pub fn emit_capability_revoked(env: &Env, event: CapabilityRevoked) {
     let topics = (symbol_short!("cap_rev"), event.capability_id);
     env.events().publish(topics, event);
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyPruned {
+    pub bounty_id: u64,
+    pub pruned_at: u64,
+}
+
+pub fn emit_bounty_pruned(env: &Env, event: BountyPruned) {
+    let topics = (symbol_short!("b_prune"), event.bounty_id);
+    env.events().publish(topics, event);
+}

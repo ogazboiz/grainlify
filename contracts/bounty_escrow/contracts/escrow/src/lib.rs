@@ -393,6 +393,8 @@ pub enum Error {
     CapabilityAmountExceeded = 27,
     CapabilityUsesExhausted = 28,
     CapabilityExceedsAuthority = 29,
+    /// Returned when an escrow's state is not valid for pruning
+    InvalidState = 30,
 }
 
 #[contracttype]
@@ -1278,6 +1280,92 @@ impl BountyEscrowContract {
             },
         );
 
+        Ok(())
+    }
+
+    /// Prune fully completed escrows (Released or Refunded) from state to save storage and gas.
+    /// Only Admin can perform this.
+    pub fn prune_bounties(env: Env, caller: Address, bounty_ids: Vec<u64>) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+
+        let mut global_index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+
+        for bounty_id in bounty_ids.iter() {
+            let escrow_key = DataKey::Escrow(bounty_id);
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Escrow>(&escrow_key)
+            {
+                // Ensure escrow is in a terminal state
+                if escrow.status != EscrowStatus::Released
+                    && escrow.status != EscrowStatus::Refunded
+                {
+                    return Err(Error::InvalidState);
+                }
+
+                // Remove from global index
+                if let Some(idx) = global_index.first_index_of(bounty_id) {
+                    global_index.remove(idx);
+                }
+
+                // Remove from depositor index
+                let dep_key = DataKey::DepositorIndex(escrow.depositor.clone());
+                if let Some(mut dep_index) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Vec<u64>>(&dep_key)
+                {
+                    if let Some(idx) = dep_index.first_index_of(bounty_id) {
+                        dep_index.remove(idx);
+                        if dep_index.is_empty() {
+                            env.storage().persistent().remove(&dep_key);
+                        } else {
+                            env.storage().persistent().set(&dep_key, &dep_index);
+                        }
+                    }
+                }
+
+                // Remove all associated data
+                env.storage().persistent().remove(&escrow_key);
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Metadata(bounty_id));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::PendingClaim(bounty_id));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::RefundApproval(bounty_id));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::ReleaseApproval(bounty_id));
+
+                events::emit_bounty_pruned(
+                    &env,
+                    events::BountyPruned {
+                        bounty_id,
+                        pruned_at: env.ledger().timestamp(),
+                    },
+                );
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowIndex, &global_index);
         Ok(())
     }
 

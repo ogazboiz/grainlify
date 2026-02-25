@@ -1421,3 +1421,133 @@ fn test_non_admin_cannot_update_anti_abuse_config() {
     }]);
     client.update_anti_abuse_config(&7200, &5, &120);
 }
+
+// =============================================================================
+// Pruning Tests (Issue #603)
+// =============================================================================
+
+#[test]
+fn test_admin_can_prune_terminal_bounties() {
+    let (env, client, contract_id) = create_test_env();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 100;
+
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let (token, _token_client, token_admin_client) = create_token_contract(&env, &token_admin);
+    client.init(&admin, &token);
+    token_admin_client.mint(&depositor, &2_000);
+
+    // Create two bounties
+    let bounty_1 = 1001;
+    let bounty_2 = 1002;
+    client.lock_funds(&depositor, &bounty_1, &1_000, &deadline);
+    client.lock_funds(&depositor, &bounty_2, &1_000, &deadline);
+
+    // Make bounty_1 terminal (Released)
+    client.release_funds(&bounty_1, &contributor);
+
+    // Make bounty_2 terminal (Refunded)
+    let info2 = client.get_escrow_info(&bounty_2);
+    env.ledger().set_timestamp(info2.deadline + 1);
+    client.refund(&bounty_2);
+
+    // Both should be in the indexes
+    env.as_contract(&contract_id, || {
+        let global_index = env
+            .storage()
+            .persistent()
+            .get::<crate::DataKey, soroban_sdk::Vec<u64>>(&crate::DataKey::EscrowIndex)
+            .unwrap();
+        assert_eq!(global_index.len(), 2);
+        let dep_index = env
+            .storage()
+            .persistent()
+            .get::<crate::DataKey, soroban_sdk::Vec<u64>>(&crate::DataKey::DepositorIndex(
+                depositor.clone(),
+            ))
+            .unwrap();
+        assert_eq!(dep_index.len(), 2);
+    });
+
+    // Prune both
+    let mut to_prune = soroban_sdk::Vec::new(&env);
+    to_prune.push_back(bounty_1);
+    to_prune.push_back(bounty_2);
+    client.prune_bounties(&admin, &to_prune);
+
+    // Both should be removed from the indexes
+    env.as_contract(&contract_id, || {
+        let global_index_after = env
+            .storage()
+            .persistent()
+            .get::<crate::DataKey, soroban_sdk::Vec<u64>>(&crate::DataKey::EscrowIndex)
+            .unwrap();
+        assert_eq!(global_index_after.len(), 0);
+        let has_dep_index = env
+            .storage()
+            .persistent()
+            .has(&crate::DataKey::DepositorIndex(depositor.clone()));
+        assert!(!has_dep_index);
+    });
+
+    // Fetching the escrows should now fail
+    let res = client.try_get_escrow_info(&bounty_1);
+    assert_eq!(res, Err(Ok(crate::Error::BountyNotFound)));
+}
+
+#[test]
+fn test_pruning_active_bounty_fails() {
+    let (env, client, _) = create_test_env();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let deadline = env.ledger().timestamp() + 100;
+
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let (token, _token_client, token_admin_client) = create_token_contract(&env, &token_admin);
+    client.init(&admin, &token);
+    token_admin_client.mint(&depositor, &1_000);
+
+    let bounty_1 = 2001;
+    client.lock_funds(&depositor, &bounty_1, &1_000, &deadline); // Status: Locked
+
+    let mut to_prune = soroban_sdk::Vec::new(&env);
+    to_prune.push_back(bounty_1);
+
+    // Should fail because it's not Released or Refunded
+    let res = client.try_prune_bounties(&admin, &to_prune);
+    assert_eq!(res, Err(Ok(crate::Error::InvalidState)));
+}
+
+#[test]
+fn test_non_admin_cannot_prune() {
+    let (env, client, contract_id) = create_test_env();
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.init(&admin, &token);
+
+    let mut to_prune = soroban_sdk::Vec::new(&env);
+    to_prune.push_back(100);
+
+    // Auth bypass trick for tests where mock_all_auths allows everyone
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "prune_bounties",
+            args: (non_admin.clone(), to_prune.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let res = client.try_prune_bounties(&non_admin, &to_prune);
+    assert_eq!(res, Err(Ok(crate::Error::Unauthorized)));
+}

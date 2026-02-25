@@ -34,11 +34,10 @@
 ///                                         ▼
 ///                                       Active
 /// ```
-
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, vec, Address, Env, String,
+    token, vec, Address, Env, IntoVal, String,
 };
 
 // ---------------------------------------------------------------------------
@@ -339,10 +338,7 @@ fn test_active_batch_exceeds_balance_rejected() {
     let r1 = Address::generate(&env);
     let r2 = Address::generate(&env);
     // 30_000 + 30_000 = 60_000 > 50_000
-    client.batch_payout(
-        &vec![&env, r1, r2],
-        &vec![&env, 30_000i128, 30_000i128],
-    );
+    client.batch_payout(&vec![&env, r1, r2], &vec![&env, 30_000i128, 30_000i128]);
 }
 
 /// Zero-amount single payout must be rejected.
@@ -363,10 +359,7 @@ fn test_active_zero_amount_in_batch_rejected() {
     let (client, _admin, _cid, _token) = setup_active_program(&env, 50_000);
     let r1 = Address::generate(&env);
     let r2 = Address::generate(&env);
-    client.batch_payout(
-        &vec![&env, r1, r2],
-        &vec![&env, 100i128, 0i128],
-    );
+    client.batch_payout(&vec![&env, r1, r2], &vec![&env, 100i128, 0i128]);
 }
 
 /// Mismatched recipients/amounts vectors must be rejected.
@@ -399,7 +392,10 @@ fn test_active_payout_history_grows() {
     let r3 = Address::generate(&env);
 
     client.single_payout(&r1, &10_000);
-    client.batch_payout(&vec![&env, r2.clone(), r3.clone()], &vec![&env, 15_000i128, 5_000i128]);
+    client.batch_payout(
+        &vec![&env, r2.clone(), r3.clone()],
+        &vec![&env, 15_000i128, 5_000i128],
+    );
 
     let info = client.get_program_info();
     assert_eq!(info.payout_history.len(), 3);
@@ -561,7 +557,12 @@ fn test_fully_paused_query_still_works() {
     client.init_program(&program_id, &admin, &token_id, &admin, &None);
     client.lock_program_funds(&100_000);
     client.initialize_contract(&admin);
-    client.set_paused(&Some(true), &Some(true), &Some(true), &None::<soroban_sdk::String>);
+    client.set_paused(
+        &Some(true),
+        &Some(true),
+        &Some(true),
+        &None::<soroban_sdk::String>,
+    );
 
     let flags = client.get_pause_flags();
     assert!(flags.lock_paused);
@@ -633,7 +634,7 @@ fn test_drained_further_payout_rejected() {
     let (client, _admin, _cid, _token) = setup_active_program(&env, 50_000);
     let r = Address::generate(&env);
     client.single_payout(&r, &50_000); // drains to 0
-    client.single_payout(&r, &1);     // must panic
+    client.single_payout(&r, &1); // must panic
 }
 
 /// Re-locking funds after drain transitions back to Active (Drained → Active).
@@ -1337,4 +1338,81 @@ fn test_drained_reactivate_triggers_pending_schedule() {
     assert_eq!(count, 1);
     assert_eq!(token_client.balance(&schedule_recipient), 30_000);
     assert_eq!(client.get_remaining_balance(), 20_000);
+}
+
+// ===========================================================================
+// PRUNING TESTS (Issue #603)
+// ===========================================================================
+
+#[test]
+fn test_admin_can_prune_drained_program() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, contract_id) = make_client(&env);
+    let (_, token_id) = fund_contract(&env, &contract_id, 100_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026-prune");
+    client.initialize_contract(&admin);
+    client.init_program(&program_id, &admin, &token_id, &admin, &None);
+    client.lock_program_funds(&100_000);
+
+    // Drain the program
+    let r = Address::generate(&env);
+    client.single_payout(&r, &100_000);
+    assert_eq!(client.get_remaining_balance(), 0);
+
+    // Prune the program
+    client.prune_program(&admin, &program_id);
+
+    // The program data should be gone. Calling `get_program_info` should panic.
+    // We can test this by checking that standard admin calls fail or by catching panic.
+    // Actually, Soroban Rust tests can use `try_get_program_info` if generated, but we can just use `env` to check storage.
+    let has_key = env.as_contract(&contract_id, || {
+        let key = crate::DataKey::Program(program_id.clone());
+        env.storage().instance().has(&key)
+    });
+    assert!(!has_key, "Program key should be removed from storage");
+}
+
+#[test]
+#[should_panic(expected = "Invalid state: program not fully drained")]
+fn test_pruning_active_program_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, contract_id) = make_client(&env);
+    let (_, token_id) = fund_contract(&env, &contract_id, 100_000);
+    let admin = Address::generate(&env);
+    let program_id = String::from_str(&env, "hack-2026-active");
+    client.initialize_contract(&admin);
+    client.init_program(&program_id, &admin, &token_id, &admin, &None);
+    client.lock_program_funds(&100_000);
+
+    // Program has 100_000 balance, not drained. Pruning should panic.
+    client.prune_program(&admin, &program_id);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_non_admin_cannot_prune_program() {
+    let env = Env::default();
+    let (client, admin, contract_id, _token) = setup_active_program(&env, 100_000);
+    client.initialize_contract(&admin);
+    let program_id = String::from_str(&env, "hack-2026");
+
+    let non_admin = Address::generate(&env);
+
+    // Mock auth for non_admin
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &non_admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "prune_program",
+            args: (non_admin.clone(), program_id.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client.prune_program(&non_admin, &program_id);
 }
