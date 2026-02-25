@@ -7,9 +7,9 @@ mod test_metadata;
 
 mod test_cross_contract_interface;
 #[cfg(test)]
-mod test_rbac;
-#[cfg(test)]
 mod test_multi_token_fees;
+#[cfg(test)]
+mod test_rbac;
 mod traits;
 
 use events::{
