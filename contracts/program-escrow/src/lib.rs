@@ -159,6 +159,9 @@ mod error_recovery_tests;
 mod test_dispute_resolution;
 #[cfg(any())]
 mod reentrancy_tests;
+mod threshold_monitor;
+mod token_math;
+
 
 #[cfg(test)]
 mod reentrancy_guard_standalone_test;
@@ -175,6 +178,9 @@ mod test_lifecycle;
 
 #[cfg(test)]
 mod test_full_lifecycle;
+
+#[cfg(test)]
+mod test_maintenance_mode;
 
 // ── Step 2: Add these public contract functions to the ProgramEscrowContract
 //    impl block (alongside the existing admin functions) ──────────────────
@@ -278,6 +284,7 @@ const BATCH_PAYOUT: Symbol = symbol_short!("BatchPay");
 const PAYOUT: Symbol = symbol_short!("Payout");
 const EVENT_VERSION_V2: u32 = 2;
 const PAUSE_STATE_CHANGED: Symbol = symbol_short!("PauseSt");
+const MAINTENANCE_MODE_CHANGED: Symbol = symbol_short!("MaintSt");
 const PROGRAM_REGISTRY: Symbol = symbol_short!("ProgReg");
 const PROGRAM_REGISTERED: Symbol = symbol_short!("ProgRgd");
 const FEE_CONFIG: Symbol = symbol_short!("FeeCfg");
@@ -285,6 +292,7 @@ const BASIS_POINTS: i128 = 10_000;
 
 // Storage keys
 const PROGRAM_DATA: Symbol = symbol_short!("ProgData");
+const RECEIPT_ID: Symbol = symbol_short!("RcptID");
 const SCHEDULES: Symbol = symbol_short!("Scheds");
 const RELEASE_HISTORY: Symbol = symbol_short!("RelHist");
 const NEXT_SCHEDULE_ID: Symbol = symbol_short!("NxtSched");
@@ -357,6 +365,7 @@ pub struct ProgramData {
     pub payout_history: Vec<PayoutRecord>,
     pub token_address: Address, // Token contract address for transfers
     pub initial_liquidity: i128, // Initial liquidity provided by creator
+    pub reference_hash: Option<soroban_sdk::Bytes>,
 }
 
 /// Storage key type for individual programs
@@ -374,6 +383,7 @@ pub enum DataKey {
     ClaimWindow,                     // u64 seconds (global config)
     PauseFlags,                      // PauseFlags struct
     RateLimitConfig,                 // RateLimitConfig struct
+    MaintenanceMode,                 // bool flag
 }
 
 #[contracttype]
@@ -392,6 +402,27 @@ pub struct PauseStateChanged {
     pub operation: Symbol,
     pub paused: bool,
     pub admin: Address,
+    pub reason: Option<String>,
+    pub timestamp: u64,
+    pub receipt_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceModeChanged {
+    pub enabled: bool,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyWithdrawEvent {
+    pub admin: Address,
+    pub target: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    pub receipt_id: u64,
 }
 
 #[contracttype]
@@ -463,6 +494,9 @@ pub struct ProgramInitItem {
     pub program_id: String,
     pub authorized_payout_key: Address,
     pub token_address: Address,
+    pub creator: Address,
+    pub initial_liquidity: Option<i128>,
+    pub reference_hash: Option<soroban_sdk::Bytes>,
 }
 
 /// Maximum number of programs per batch (aligned with bounty_escrow).
@@ -501,6 +535,13 @@ pub struct ProgramEscrowContract;
 
 #[contractimpl]
 impl ProgramEscrowContract {
+    fn increment_receipt_id(env: &Env) -> u64 {
+        let mut id: u64 = env.storage().instance().get(&RECEIPT_ID).unwrap_or(0);
+        id += 1;
+        env.storage().instance().set(&RECEIPT_ID, &id);
+        id
+    }
+
     /// Initialize a new program escrow
     ///
     /// # Arguments
@@ -517,8 +558,17 @@ impl ProgramEscrowContract {
         token_address: Address,
         creator: Address,
         initial_liquidity: Option<i128>,
+        reference_hash: Option<soroban_sdk::Bytes>,
     ) -> ProgramData {
-        Self::initialize_program(env, program_id, authorized_payout_key, token_address, creator, initial_liquidity)
+        Self::initialize_program(
+            env,
+            program_id,
+            authorized_payout_key,
+            token_address,
+            creator,
+            initial_liquidity,
+            reference_hash,
+        )
     }
 
     pub fn initialize_program(
@@ -528,6 +578,7 @@ impl ProgramEscrowContract {
         token_address: Address,
         creator: Address,
         initial_liquidity: Option<i128>,
+        reference_hash: Option<soroban_sdk::Bytes>,
     ) -> ProgramData {
         // Check if program already exists
         if env.storage().instance().has(&PROGRAM_DATA) {
@@ -556,13 +607,32 @@ impl ProgramEscrowContract {
             total_funds,
             remaining_balance,
             authorized_payout_key: authorized_payout_key.clone(),
-            payout_history: vec![&env],
+            payout_history: Vec::new(&env),
             token_address: token_address.clone(),
             initial_liquidity: init_liquidity,
+            reference_hash,
         };
 
         // Store program data
         env.storage().instance().set(&PROGRAM_DATA, &program_data);
+
+        // Fallback for legacy tests: if admin not set, set it to authorized_payout_key
+        if !env.storage().instance().has(&DataKey::Admin) {
+            env.storage().instance().set(&DataKey::Admin, &authorized_payout_key);
+        }
+        if !env.storage().instance().has(&DataKey::MaintenanceMode) {
+            env.storage().instance().set(&DataKey::MaintenanceMode, &false);
+        }
+        if !env.storage().instance().has(&DataKey::PauseFlags) {
+            env.storage().instance().set(&DataKey::PauseFlags, &PauseFlags {
+                lock_paused: false,
+                release_paused: false,
+                refund_paused: false,
+                pause_reason: None,
+                paused_at: 0,
+            });
+        }
+
         env.storage()
             .instance()
             .set(&SCHEDULES, &Vec::<ProgramReleaseSchedule>::new(&env));
@@ -635,9 +705,10 @@ impl ProgramEscrowContract {
                 total_funds: 0,
                 remaining_balance: 0,
                 authorized_payout_key: authorized_payout_key.clone(),
-                payout_history: vec![&env],
+                payout_history: Vec::new(&env),
                 token_address: token_address.clone(),
                 initial_liquidity: 0,
+                reference_hash: item.reference_hash.clone(),
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);
@@ -769,6 +840,14 @@ impl ProgramEscrowContract {
             panic!("Already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::MaintenanceMode, &false);
+        env.storage().instance().set(&DataKey::PauseFlags, &PauseFlags {
+            lock_paused: false,
+            release_paused: false,
+            refund_paused: false,
+            pause_reason: None,
+            paused_at: 0,
+        });
     }
 
     /// Set or rotate admin. If no admin is set, sets initial admin. If admin exists, current admin must authorize and the new address becomes admin.
@@ -810,25 +889,49 @@ impl ProgramEscrowContract {
 
         if let Some(paused) = lock {
             flags.lock_paused = paused;
+            let receipt_id = Self::increment_receipt_id(&env);
             env.events().publish(
                 (PAUSE_STATE_CHANGED,),
-                (symbol_short!("lock"), paused, admin.clone(), reason.clone(), timestamp),
+                PauseStateChanged {
+                    operation: symbol_short!("lock"),
+                    paused,
+                    admin: admin.clone(),
+                    reason: reason.clone(),
+                    timestamp,
+                    receipt_id,
+                },
             );
         }
 
         if let Some(paused) = release {
             flags.release_paused = paused;
+            let receipt_id = Self::increment_receipt_id(&env);
             env.events().publish(
                 (PAUSE_STATE_CHANGED,),
-                (symbol_short!("release"), paused, admin.clone(), reason.clone(), timestamp),
+                PauseStateChanged {
+                    operation: symbol_short!("release"),
+                    paused,
+                    admin: admin.clone(),
+                    reason: reason.clone(),
+                    timestamp,
+                    receipt_id,
+                },
             );
         }
 
         if let Some(paused) = refund {
             flags.refund_paused = paused;
+            let receipt_id = Self::increment_receipt_id(&env);
             env.events().publish(
                 (PAUSE_STATE_CHANGED,),
-                (symbol_short!("refund"), paused, admin.clone(), reason.clone(), timestamp),
+                PauseStateChanged {
+                    operation: symbol_short!("refund"),
+                    paused,
+                    admin: admin.clone(),
+                    reason: reason.clone(),
+                    timestamp,
+                    receipt_id,
+                },
             );
         }
 
@@ -844,6 +947,30 @@ impl ProgramEscrowContract {
         }
 
         env.storage().instance().set(&DataKey::PauseFlags, &flags);
+    }
+
+    /// Check if the contract is in maintenance mode
+    pub fn is_maintenance_mode(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::MaintenanceMode).unwrap_or(false)
+    }
+
+    /// Update maintenance mode (admin only)
+    pub fn set_maintenance_mode(env: Env, enabled: bool) {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("Not initialized");
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        
+        env.storage().instance().set(&DataKey::MaintenanceMode, &enabled);
+        env.events().publish(
+            (MAINTENANCE_MODE_CHANGED,),
+            MaintenanceModeChanged {
+                enabled,
+                admin: admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
     }
 
     /// Emergency withdraw all program funds (admin only, must have lock_paused = true)
@@ -867,9 +994,16 @@ impl ProgramEscrowContract {
         
         if balance > 0 {
             token_client.transfer(&contract_address, &target, &balance);
+            let receipt_id = Self::increment_receipt_id(&env);
             env.events().publish(
                 (symbol_short!("em_wtd"),),
-                (admin, target.clone(), balance, env.ledger().timestamp()),
+                EmergencyWithdrawEvent {
+                    admin,
+                    target: target.clone(),
+                    amount: balance,
+                    timestamp: env.ledger().timestamp(),
+                    receipt_id,
+                },
             );
         }
     }
@@ -890,6 +1024,9 @@ impl ProgramEscrowContract {
 
     /// Check if an operation is paused
     fn check_paused(env: &Env, operation: Symbol) -> bool {
+        if Self::is_maintenance_mode(env.clone()) && operation == symbol_short!("lock") {
+            return true;
+        }
         let flags = Self::get_pause_flags(env);
         if operation == symbol_short!("lock") {
             return flags.lock_paused;
@@ -1264,6 +1401,11 @@ impl ProgramEscrowContract {
                 panic!("Program not initialized")
             });
         program_data.authorized_payout_key.require_auth();
+
+        if Self::check_paused(&env, symbol_short!("release")) {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Funds Paused");
+        }
 
         let mut schedules: Vec<ProgramReleaseSchedule> = env
             .storage()

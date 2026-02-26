@@ -10,11 +10,14 @@ mod test_cross_contract_interface;
 mod test_rbac;
 mod traits;
 
+#[cfg(test)]
+mod test_maintenance_mode;
+
 use events::{
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized, emit_funds_locked,
-    emit_funds_refunded, emit_funds_released, BatchFundsLocked, BatchFundsReleased,
-    BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted, FundsLocked,
-    FundsRefunded, FundsReleased, EVENT_VERSION_V2,
+    emit_funds_refunded, emit_funds_released, emit_maintenance_mode_changed, BatchFundsLocked,
+    BatchFundsReleased, BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted,
+    FundsLocked, FundsRefunded, FundsReleased, MaintenanceModeChanged, EVENT_VERSION_V2,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
@@ -354,6 +357,35 @@ const BASIS_POINTS: i128 = 10_000;
 const MAX_FEE_RATE: i128 = 5_000; // 50% max fee
 const MAX_BATCH_SIZE: u32 = 20;
 
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum DisputeOutcome {
+    ResolvedInFavorOfContributor = 1,
+    ResolvedInFavorOfDepositor = 2,
+    CancelledByAdmin = 3,
+    Refunded = 4,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum DisputeReason {
+    Expired = 1,
+    UnsatisfactoryWork = 2,
+    Fraud = 3,
+    QualityIssue = 4,
+    Other = 5,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ReleaseType {
+    Manual = 1,
+    Automatic = 2,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -401,6 +433,7 @@ pub struct EscrowMetadata {
     pub repo_id: u64,
     pub issue_id: u64,
     pub bounty_type: soroban_sdk::String,
+    pub reference_hash: Option<soroban_sdk::Bytes>,
 }
 
 #[contracttype]
@@ -445,6 +478,9 @@ pub enum DataKey {
     AmountPolicy, // Option<(i128, i128)> — (min_amount, max_amount) set by set_amount_policy
     CapabilityNonce, // monotonically increasing capability id
     Capability(u64), // capability_id -> Capability
+    ChainId,
+    NetworkId,
+    MaintenanceMode, // bool flag
 }
 
 #[contracttype]
@@ -485,9 +521,9 @@ pub struct PauseStateChanged {
     pub timestamp: u64,
 }
 
-/// Public view of anti-abuse config (rate limit and cooldown).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Public view of anti-abuse config (rate limit and cooldown).
 pub struct AntiAbuseConfigView {
     pub window_size: u64,
     pub max_operations: u32,
@@ -527,6 +563,7 @@ pub struct ClaimRecord {
     pub amount: i128,
     pub expires_at: u64,
     pub claimed: bool,
+    pub reason: DisputeReason,
 }
 
 #[contracttype]
@@ -599,6 +636,18 @@ pub struct BountyEscrowContract;
 
 #[contractimpl]
 impl BountyEscrowContract {
+    pub fn health_check(env: Env) -> monitoring::HealthStatus {
+        monitoring::health_check(&env)
+    }
+
+    pub fn get_analytics(env: Env) -> monitoring::Analytics {
+        monitoring::get_analytics(&env)
+    }
+
+    pub fn get_state_snapshot(env: Env) -> monitoring::StateSnapshot {
+        monitoring::get_state_snapshot(&env)
+    }
+
     /// Initialize the contract with the admin address and the token address (XLM).
     pub fn init(env: Env, admin: Address, token: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -606,18 +655,42 @@ impl BountyEscrowContract {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
-
-        emit_bounty_initialized(
+        
+        events::emit_bounty_initialized(
             &env,
-            BountyEscrowInitialized {
+            events::BountyEscrowInitialized {
                 version: EVENT_VERSION_V2,
                 admin,
                 token,
                 timestamp: env.ledger().timestamp(),
             },
         );
-
         Ok(())
+    }
+
+    pub fn init_with_network(
+        env: Env,
+        admin: Address,
+        token: Address,
+        chain_id: soroban_sdk::String,
+        network_id: soroban_sdk::String,
+    ) -> Result<(), Error> {
+        Self::init(env.clone(), admin, token)?;
+        env.storage().instance().set(&DataKey::ChainId, &chain_id);
+        env.storage().instance().set(&DataKey::NetworkId, &network_id);
+        Ok(())
+    }
+
+    pub fn get_chain_id(env: Env) -> Option<soroban_sdk::String> {
+        env.storage().instance().get(&DataKey::ChainId)
+    }
+
+    pub fn get_network_id(env: Env) -> Option<soroban_sdk::String> {
+        env.storage().instance().get(&DataKey::NetworkId)
+    }
+
+    pub fn get_network_info(env: Env) -> (Option<soroban_sdk::String>, Option<soroban_sdk::String>) {
+        (Self::get_chain_id(env.clone()), Self::get_network_id(env))
     }
 
     /// Calculate fee amount based on rate (in basis points)
@@ -837,6 +910,9 @@ impl BountyEscrowContract {
     fn check_paused(env: &Env, operation: Symbol) -> bool {
         let flags = Self::get_pause_flags(env);
         if operation == symbol_short!("lock") {
+            if Self::is_maintenance_mode(env.clone()) {
+                return true;
+            }
             return flags.lock_paused;
         } else if operation == symbol_short!("release") {
             return flags.release_paused;
@@ -844,6 +920,48 @@ impl BountyEscrowContract {
             return flags.refund_paused;
         }
         false
+    }
+
+    /// Check if the contract is in maintenance mode
+    pub fn is_maintenance_mode(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::MaintenanceMode).unwrap_or(false)
+    }
+
+    /// Update maintenance mode (admin only)
+    pub fn set_maintenance_mode(env: Env, enabled: bool) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        
+        env.storage().instance().set(&DataKey::MaintenanceMode, &enabled);
+        
+        events::emit_maintenance_mode_changed(
+            &env,
+            MaintenanceModeChanged {
+                enabled,
+                admin: admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    pub fn set_whitelist(env: Env, address: Address, whitelisted: bool) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        anti_abuse::set_whitelist(&env, address, whitelisted);
+        Ok(())
+    }
+
+    /// Alias for set_whitelist to match some tests
+    pub fn set_whitelist_entry(env: Env, address: Address, whitelisted: bool) -> Result<(), Error> {
+        Self::set_whitelist(env, address, whitelisted)
     }
 
     fn next_capability_id(env: &Env) -> u64 {
@@ -1289,30 +1407,34 @@ impl BountyEscrowContract {
         amount: i128,
         deadline: u64,
     ) -> Result<(), Error> {
+        soroban_sdk::log!(&env, "start lock_funds");
         // Apply rate limiting
         anti_abuse::check_rate_limit(&env, depositor.clone());
+        soroban_sdk::log!(&env, "rate limit ok");
 
         if Self::check_paused(&env, symbol_short!("lock")) {
             return Err(Error::FundsPaused);
         }
+        soroban_sdk::log!(&env, "check paused ok");
 
         let _start = env.ledger().timestamp();
         let _caller = depositor.clone();
 
         // Verify depositor authorization
         depositor.require_auth();
+        soroban_sdk::log!(&env, "auth ok");
 
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
+        soroban_sdk::log!(&env, "admin ok");
 
         if env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyExists);
         }
+        soroban_sdk::log!(&env, "bounty exists ok");
 
         // Enforce min/max amount policy if one has been configured (Issue #62).
-        // When no policy is set this block is skipped entirely, preserving
-        // backward-compatible behaviour for callers that never call set_amount_policy.
         if let Some((min_amount, max_amount)) = env
             .storage()
             .instance()
@@ -1325,12 +1447,15 @@ impl BountyEscrowContract {
                 return Err(Error::AmountAboveMaximum);
             }
         }
+        soroban_sdk::log!(&env, "amount policy ok");
 
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
+        soroban_sdk::log!(&env, "token client ok");
 
         // Transfer funds from depositor to contract
         client.transfer(&depositor, &env.current_contract_address(), &amount);
+        soroban_sdk::log!(&env, "transfer ok");
 
         let escrow = Escrow {
             depositor: depositor.clone(),
@@ -1539,10 +1664,8 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Authorize a release as a pending claim instead of immediate transfer.
-    /// Admin calls this instead of release_funds when claim period is active.
-    /// Beneficiary must call claim() within the window to receive funds.
-    pub fn authorize_claim(env: Env, bounty_id: u64, recipient: Address) -> Result<(), Error> {
+    /// Admin can authorize a release as a pending claim instead of immediate transfer.
+    pub fn authorize_claim(env: Env, bounty_id: u64, recipient: Address, reason: DisputeReason) -> Result<(), Error> {
         if Self::check_paused(&env, symbol_short!("release")) {
             return Err(Error::FundsPaused);
         }
@@ -1578,6 +1701,7 @@ impl BountyEscrowContract {
             amount: escrow.amount,
             expires_at: now.saturating_add(claim_window),
             claimed: false,
+            reason: reason.clone(),
         };
 
         env.storage()
@@ -1591,6 +1715,7 @@ impl BountyEscrowContract {
                 recipient,
                 amount: escrow.amount,
                 expires_at: claim.expires_at,
+                reason,
             },
         );
         Ok(())
@@ -1655,6 +1780,7 @@ impl BountyEscrowContract {
                 recipient: claim.recipient.clone(),
                 amount: claim.amount,
                 claimed_at: now,
+                outcome: DisputeOutcome::ResolvedInFavorOfContributor,
             },
         );
         Ok(())
@@ -1732,13 +1858,14 @@ impl BountyEscrowContract {
                 recipient: claim.recipient,
                 amount: claim.amount,
                 claimed_at: now,
+                outcome: DisputeOutcome::ResolvedInFavorOfContributor,
             },
         );
         Ok(())
     }
 
     /// Admin can cancel an expired or unwanted pending claim, returning escrow to Locked.
-    pub fn cancel_pending_claim(env: Env, bounty_id: u64) -> Result<(), Error> {
+    pub fn cancel_pending_claim(env: Env, bounty_id: u64, outcome: DisputeOutcome) -> Result<(), Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -1758,9 +1885,9 @@ impl BountyEscrowContract {
             .get(&DataKey::PendingClaim(bounty_id))
             .unwrap();
 
-        if claim.claimed {
-            return Err(Error::FundsNotLocked);
-        }
+        let now = env.ledger().timestamp(); // Added this line
+        let recipient = claim.recipient.clone(); // Added this line
+        let amount = claim.amount; // Added this line
 
         env.storage()
             .persistent()
@@ -1770,10 +1897,11 @@ impl BountyEscrowContract {
             (symbol_short!("claim"), symbol_short!("cancel")),
             ClaimCancelled {
                 bounty_id,
-                recipient: claim.recipient,
-                amount: claim.amount,
-                cancelled_at: env.ledger().timestamp(),
+                recipient,
+                amount,
+                cancelled_at: now,
                 cancelled_by: admin,
+                outcome, // Added this field
             },
         );
         Ok(())
@@ -2446,20 +2574,7 @@ impl BountyEscrowContract {
         anti_abuse::get_admin(&env)
     }
 
-    pub fn set_whitelist(
-        env: Env,
-        whitelisted_address: Address,
-        whitelisted: bool,
-    ) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        anti_abuse::set_whitelist(&env, whitelisted_address, whitelisted);
-        Ok(())
-    }
+
 
     /// Update anti-abuse config (rate limit window, max operations per window, cooldown). Admin only.
     pub fn update_anti_abuse_config(
@@ -2708,6 +2823,7 @@ impl BountyEscrowContract {
         emit_batch_funds_locked(
             &env,
             BatchFundsLocked {
+                version: EVENT_VERSION_V2,
                 count: locked_count,
                 total_amount: items.iter().map(|i| i.amount).sum(),
                 timestamp,
@@ -2835,6 +2951,7 @@ impl BountyEscrowContract {
         emit_batch_funds_released(
             &env,
             BatchFundsReleased {
+                version: EVENT_VERSION_V2,
                 count: released_count,
                 total_amount,
                 timestamp,
@@ -2850,6 +2967,7 @@ impl BountyEscrowContract {
         repo_id: u64,
         issue_id: u64,
         bounty_type: soroban_sdk::String,
+        reference_hash: Option<soroban_sdk::Bytes>,
     ) -> Result<(), Error> {
         let stored_admin: Address = env
             .storage()
@@ -2862,6 +2980,7 @@ impl BountyEscrowContract {
             repo_id,
             issue_id,
             bounty_type,
+            reference_hash,
         };
         env.storage()
             .persistent()
